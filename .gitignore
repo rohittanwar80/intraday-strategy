@@ -1,0 +1,14 @@
+# Data never enters git. It lives in the upstream repos.
+*.parquet
+*.csv
+artifacts/
+
+# Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

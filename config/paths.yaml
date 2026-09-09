@@ -1,0 +1,169 @@
+# config/paths.yaml
+#
+# Every external path used by this project, in one place.
+#
+# Spec §10: the upstream venv lives in a THIRD repository (intraday-rank),
+# which has already broken once. Nothing in src/ or scripts/ should contain an
+# absolute path; everything resolves through this file.
+#
+# DELIBERATELY NOT RECORDED HERE: row counts, column lists, date ranges, or
+# median_names_per_bar for the handover files. Those live in MANIFEST.json and
+# the verifier reads them from there. Two files holding the same numbers is how
+# they drift apart, and amendments §11.2 rule 2 is explicit that metadata
+# belongs with the data, not in a second location.
+#
+# What IS recorded here: locations, the four panel end dates, and the decisions
+# this project has made.
+
+# ---------------------------------------------------------------------------
+# Roots
+# ---------------------------------------------------------------------------
+roots:
+  # This project.
+  project: /Users/rohittanwar/Documents/Claude/Projects/intraday-strategy
+
+  # Upstream: produced the scores. Consumed read-only. Never written to.
+  upstream: /Users/rohittanwar/Documents/Claude/Projects/two-stage-intraday
+
+  # Third repository: holds the bar tree and the venv the upstream code runs
+  # under. This is the one that broke.
+  data: /Users/rohittanwar/Documents/Claude/Projects/intraday/intraday-rank/data
+
+# ---------------------------------------------------------------------------
+# Upstream handover — the fixed dataset this project consumes
+# ---------------------------------------------------------------------------
+handover:
+  dir: "${roots.upstream}/handover"
+  manifest: "${roots.upstream}/handover/MANIFEST.json"
+  files:
+    development_2020_2022: "${roots.upstream}/handover/development_2020_2022.parquet"
+    development_2023_2024: "${roots.upstream}/handover/development_2023_2024.parquet"
+    validation_2025: "${roots.upstream}/handover/validation_2025.parquet"
+
+# ---------------------------------------------------------------------------
+# Upstream artifacts — read only when a specific question requires it
+# ---------------------------------------------------------------------------
+upstream_artifacts:
+  # Look ledger. Moves with this project; every validation/holdout read is
+  # appended here.
+  holdout_ledger: "${roots.upstream}/artifacts/holdout_ledger.json"
+
+  # Full 76-column stage 2 feature panel. Covers 2020-2025 ONLY (amendments
+  # §14). If a handover column is missing, it is a join against this — never a
+  # model rerun.
+  features_stage2_full: "${roots.upstream}/artifacts/features_stage2_full"
+
+  # Raw stage 2 labels. Needed for the 1.33x dispersion work (spec §12 task 1,
+  # currently deprioritised). Spends no looks.
+  labels_stage2: "${roots.upstream}/artifacts/labels_stage2"
+
+  # Frozen model code. Reading src/ is OUT OF SCOPE except for the Phase 5
+  # holdout rerun, which needs the stage 2 feature build and scoring path.
+  # See amendments §15 for the frozen configuration.
+  src: "${roots.upstream}/src"
+
+# ---------------------------------------------------------------------------
+# Bar tree
+# ---------------------------------------------------------------------------
+bars:
+  sp500: "${roots.data}/raw"                  # 518 dirs = 503 + 15 context ETFs
+  russell: "${roots.data}/raw_russell"        # 1,957 dirs
+  adjusted: "${roots.data}/adjusted"          # 16 symbols, S&P only (§12.1)
+  interim: "${roots.data}/interim"
+  sessions: "${roots.data}/interim/sessions.parquet"
+  universe_russell: "${roots.data}/interim/universe_russell.parquet"
+
+  # Schema, per amendments §14 and the bar file schema table.
+  #   {SYMBOL}/daily.parquet
+  #   {SYMBOL}/daily_divadj.parquet
+  #   {SYMBOL}/5min_{year}.parquet
+  #
+  # t_start (unix seconds, bar START) is AUTHORITATIVE. Derive session labels
+  # from it, not from ts_close, so the spec's wall-clock times map onto stored
+  # rows under reading A.
+  #
+  # The upstream src/data/paths.py CANNOT be inherited: it hardcodes the S&P
+  # tree, has no raw_russell branch, and returns a non-existent path SILENTLY
+  # for any Russell symbol. This project needs its own reader.
+  time_column: t_start
+  timezone: America/New_York
+
+# ---------------------------------------------------------------------------
+# Panel end dates — amendments §12.5
+# ---------------------------------------------------------------------------
+# Four trees stop on four different days, because each was pulled on the day it
+# was fetched. Confirmed by inventory scan 2026-09-09: raw_russell coverage sits
+# at 100% through 08-27, then drops to 8% (the §5 no_data retries, run 08-31).
+#
+# The binding constraint is raw/, not raw_russell/. The regime columns
+# (spy_above_200sma, spy_ret_prev, vxx_vol_63, vxx_vol_pct, spy_intraday) come
+# from the context ETFs. A bar with Russell prices and no SPY context is not a
+# scoreable bar.
+panel_end_dates:
+  sp500_and_etfs: 2026-08-25    # BINDING
+  spy: 2026-08-26
+  russell: 2026-08-27
+  retried_files: 2026-08-31
+
+common_end_date: 2026-08-25
+
+# ---------------------------------------------------------------------------
+# Windows
+# ---------------------------------------------------------------------------
+# Development and validation ranges are NOT restated here; read them from
+# MANIFEST.json. Only the holdout is recorded, because its effective bounds are
+# a decision this project made.
+windows:
+  holdout:
+    nominal_start: 2025-09-01   # spec §9; a Monday, Labor Day, no session
+    nominal_end: 2026-08-31     # spec §9
+    effective_start: 2025-09-02 # first session after Labor Day
+    effective_end: 2026-08-25   # = common_end_date
+    status: FROZEN
+    looks_spent: 0
+    # Both truncations are STRUCTURAL, forced by the calendar and by the
+    # download boundary. Neither is a configuration choice, and no threshold we
+    # picked determines either: coverage goes 100% -> 8% in one step, so any
+    # floor between 0.09 and 1.00 returns the same date.
+    truncation_reason: >
+      Start moved off a market holiday. End set by the earliest panel end date
+      (raw/, the context ETFs) per amendments §12.5, not by raw_russell/.
+    # Scoring this window is NOT a mechanical rerun. features_stage2_full stops
+    # at 2025, so the stage 2 feature build must run first, then scoring under
+    # the frozen configuration in amendments §15.
+
+# ---------------------------------------------------------------------------
+# Fixed conventions — not adjustable in this project
+# ---------------------------------------------------------------------------
+conventions:
+  # Signal at bar t fills at the OPEN of bar t+1. Entering at the signal bar's
+  # close inflated apparent signal by ~30% upstream (Appendix A.5). The label
+  # was built on the next bar's open; any other entry measures a different
+  # strategy than the one validated.
+  entry: open_of_bar_t_plus_1
+  exit: close_of_1555_bar          # carries the auction, 8.4x midday volume
+
+  # Rank, not predicted return. Calibration ordering held in development but
+  # levels never did, and in validation the mapping inverted entirely.
+  deploy_signal: score_pct
+
+  bar_stride: 4                    # 20-minute resolution
+  scoring_bars: [
+    "09:50", "10:10", "10:30", "10:50", "11:10", "11:30", "11:50",
+    "12:10", "12:30", "12:50", "13:10", "13:30", "13:50",
+    "14:10", "14:30", "14:50", "15:10", "15:30", "15:50"
+  ]
+  # The 09:35 bar has NEVER been scored (amendments §12.6): features start
+  # 09:30, labels 09:35, and a stride-4 grid anchored at 09:30 skips it. The
+  # first tradeable bar is therefore unmeasured. Edge peaks at 10:30-10:50, so
+  # this is unlikely to change conclusions, but it is not a measured zero.
+
+# ---------------------------------------------------------------------------
+# This project's outputs
+# ---------------------------------------------------------------------------
+outputs:
+  artifacts: "${roots.project}/artifacts"
+  # Never write into any upstream or data path. Everything this project
+  # produces lands here, and every output records what produced it
+  # (amendments §11.6: source file content hash, parameters, git commit,
+  # command, wall-clock time).
