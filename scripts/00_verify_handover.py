@@ -1,340 +1,566 @@
 #!/usr/bin/env python3
 """
-Verify the handover dataset before any analysis depends on it.
+scripts/00_verify_handover.py -- runs before any analysis. Nothing else first.
 
---------------------------------------------------------------------------------
-WHY THIS EXISTS
---------------------------------------------------------------------------------
+Amendments §11.1: four times upstream, a stale or mismatched file produced
+plausible numbers that were acted on before the problem was found. Two of the
+four made results look BETTER than the truth, which is the direction that does
+not prompt suspicion. Every one was detectable from the data itself.
 
-Four times in the upstream project, a stale or mismatched file produced
-plausible numbers that were acted on before the problem was found:
+Eight check groups:
 
-  - An ORB cache keyed only by filename served a 50-symbol/1-year file to a
-    503-symbol/5-year run. Three consecutive outputs were identical and all
-    looked reasonable.
-  - Stage 1 labels covered only 2023 while features covered nine years. Six
-    years silently dropped in the join; every table printed "development
-    window" results computed from one year.
-  - A percentile analysis read files whose paths matched by coincidence,
-    producing numbers that disagreed with the training run in both directions.
-  - Two runs sharing a configuration tag but differing in years wrote to the
-    same filename. The second overwrote the first, and the loss was only
-    noticed when a downstream date range looked wrong.
+    G1 structure          files exist, readable, columns match the manifest
+    G2 identity           row counts, date ranges, bar grids, names/bar
+    G3 keys               no duplicate or null (symbol, date, bar_time, index)
+    G4 prices + RECOMPUTE the check that matters most (§11.3)
+    G5 signal             score_pct in [0,1], spans its cross-section, ranks score
+    G6 grid               stride-4 bar times, no 09:35, sessions are weekdays
+    G7 reconciliation     totals against MANIFEST.json
+    G8 distribution       target moments; IC on DEVELOPMENT ONLY
 
-EVERY ONE WAS DETECTABLE FROM THE DATA ITSELF. None was caught by inspection;
-all were caught by a downstream number looking odd, which is the expensive way.
+§11.3 is the one to read first. If
 
-So: assertions on load, not inspection after. This script fails loudly rather
-than letting an analysis proceed on a file that is not what it claims to be.
+    target == exit_price / entry_price - 1
 
---------------------------------------------------------------------------------
-WHAT IT CHECKS
---------------------------------------------------------------------------------
+does not hold, the prices and the label came from different places and nothing
+downstream is meaningful -- sizing, P&L, cost impact all rest on those two
+prices being the ones the label was built from. This script tests it on every
+row of all 17.9M, not a sample.
 
-  1. STRUCTURE      required columns present, dtypes sane
-  2. IDENTITY       date range and row count match the manifest
-  3. KEYS           no duplicate (symbol, date, bar_time)
-  4. PRICES         positive, non-null, and `target` RECOMPUTES from them
-  5. SIGNAL         score_pct spans [0,1] within each cross-section
-  6. GRID           bar times consistent, cross-sections plausibly sized
-  7. RECONCILE      row counts against the upstream source files
-  8. SANITY         return distributions in a believable range
+THE LOOK BOUNDARY
+-----------------
+validation_2025.parquet is SPENT (amendments §16). This script therefore
+computes NO score-versus-target statistic on it. The line drawn:
 
-Check 4 is the strongest: if `close_1555 / entry_price - 1` does not reproduce
-`target`, the prices and the label came from different places and nothing
-downstream can be trusted.
+  * statistics of `target` ALONE spend nothing -- they are properties of the
+    labels, not of the model. §17 item 2 says so explicitly about drift and
+    dispersion.
+  * any statistic JOINING `score` to `target` is an evaluation, and on
+    validation that is a second look.
+
+So G8 reports target moments for all three files and IC for development only.
 
 Usage
 -----
     python scripts/00_verify_handover.py
-    python scripts/00_verify_handover.py --strict     # any warning is a failure
+    python scripts/00_verify_handover.py --strict     # warnings become failures
+    python scripts/00_verify_handover.py --no-hash    # skip sha256 (faster)
+
+Exit codes: 0 ok, 1 checks failed, 2 could not run.
+
+Peak memory is roughly 2 GB on the largest file; columns are read in subsets
+rather than loading the panel.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import sys
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
-REQUIRED = [
-    "symbol", "date", "bar_time", "index_name",
-    "score", "score_pct", "target",
-    "entry_price", "exit_price",
-]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.data.paths import load_paths  # noqa: E402
 
-EXPECTED_EXTRAS = [
-    "ibar_atr_pct_14", "or_position", "dist_day_low",
-    "ibar_log_dollar_volume", "bar_of_day",
-    "breadth_above_open", "spy_above_200sma", "vxx_vol_63",
-]
+PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
-# Plausible ranges. Wide on purpose -- these catch corruption, not nuance.
-BOUNDS = {
-    "target": (-3.0, 3.0),
-    "score_pct": (0.0, 1.0),
-    "entry_price": (0.5, 100_000.0),
-    "exit_price": (0.5, 100_000.0),
+KEY_COLS = ["symbol", "date", "bar_time", "index_name"]
+RECOMPUTE_TIGHT = 1e-9    # float64 round-trip; anything above is suspicious
+RECOMPUTE_LOOSE = 1e-6    # beyond this the label did not come from these prices
+LOOSE_FRAC_FAIL = 1e-4    # >0.01% of rows past the loose bound -> FAIL
+
+# Universe intraday drift recorded upstream (amendments §16, spec §3).
+# Development periods all negative; validation flipped positive. These are
+# reconciliation targets, not thresholds -- a mismatch means we are reading a
+# different file than the one those numbers came from.
+EXPECTED_DRIFT_BPS = {
+    "development_2020_2022": (-4.0, -1.0),
+    "development_2023_2024": (-4.0, -1.0),
+    "validation_2025": (2.0, 6.0),
+}
+EXPECTED_IC = {  # development only; validation IC is not computed here
+    "development_2020_2022": 0.0413,
+    "development_2023_2024": 0.0344,
 }
 
 
+@dataclass
+class Check:
+    group: str
+    file: str
+    name: str
+    status: str
+    detail: str
+
+
 class Report:
-    def __init__(self, strict: bool):
-        self.strict = strict
-        self.failures: list[str] = []
-        self.warnings: list[str] = []
+    def __init__(self) -> None:
+        self.checks: list[Check] = []
 
-    def check(self, ok: bool, label: str, detail: str = "") -> bool:
-        mark = "PASS" if ok else "FAIL"
-        print(f"    [{mark}] {label}" + (f"  -- {detail}" if detail else ""))
-        if not ok:
-            self.failures.append(f"{label}: {detail}")
-        return ok
+    def add(self, group: str, file: str, name: str, status: str, detail: str = "") -> None:
+        self.checks.append(Check(group, file, name, status, detail))
+        if status != PASS:
+            print(f"    {status}  {name}: {detail}", file=sys.stderr)
 
-    def warn(self, ok: bool, label: str, detail: str = "") -> bool:
-        if ok:
-            print(f"    [PASS] {label}" + (f"  -- {detail}" if detail else ""))
-        else:
-            print(f"    [WARN] {label}" + (f"  -- {detail}" if detail else ""))
-            (self.failures if self.strict else self.warnings).append(
-                f"{label}: {detail}")
-        return ok
+    def ok(self, group, file, name, detail=""):
+        self.add(group, file, name, PASS, detail)
+
+    def counts(self) -> dict[str, int]:
+        out = {PASS: 0, WARN: 0, FAIL: 0}
+        for c in self.checks:
+            out[c.status] += 1
+        return out
 
 
-def verify_file(path: Path, spec: dict, rep: Report,
-                upstream: Path | None) -> None:
-    print(f"\n{'=' * 78}\n{path.name}\n{'=' * 78}")
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
-    df = pd.read_parquet(path)
-    df["date"] = pd.to_datetime(df["date"])
-    print(f"  {len(df):,} rows x {df.shape[1]} columns")
+def sha256(path: Path, chunk: int = 1 << 22) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while block := fh.read(chunk):
+            h.update(block)
+    return h.hexdigest()
 
-    # -- 1. structure ---------------------------------------------------
-    print("\n  1. STRUCTURE")
-    missing = [c for c in REQUIRED if c not in df.columns]
-    rep.check(not missing, "required columns present",
-              f"missing {missing}" if missing else "")
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def as_date_series(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s).dt.date if not np.issubdtype(s.dtype, np.datetime64) \
+        else s.dt.date
+
+
+# ---------------------------------------------------------------------------
+# check groups
+# ---------------------------------------------------------------------------
+
+def g1_structure(rep: Report, tag: str, path: Path, spec: dict) -> set[str] | None:
+    if not path.exists():
+        rep.add("G1", tag, "file_exists", FAIL, f"{path} not found")
+        return None
+    try:
+        schema = pq.read_schema(path)
+    except Exception as exc:  # noqa: BLE001
+        rep.add("G1", tag, "readable", FAIL, str(exc))
+        return None
+
+    have = set(schema.names)
+    want = set(spec["columns"])
+    missing, extra = want - have, have - want
+
     if missing:
-        print("     stopping: cannot verify further without these")
+        rep.add("G1", tag, "columns_present", FAIL,
+                f"manifest lists {len(missing)} column(s) not in the file: {sorted(missing)}")
+    else:
+        rep.ok("G1", tag, "columns_present", f"{len(want)} manifest columns all present")
+
+    if extra:
+        rep.add("G1", tag, "columns_extra", WARN,
+                f"file has {len(extra)} column(s) the manifest does not list: {sorted(extra)}")
+
+    # The model groups by (date, bar_time, index). Spec §4 lists index_name as a
+    # key column. If it is absent the cross-section is not what the spec says.
+    if "index_name" not in have:
+        rep.add("G1", tag, "index_name_present", FAIL,
+                "no index_name column, but the objective is LambdaRank grouped by "
+                "(date, bar_time, index) and spec §4 lists it as a key")
+    return have
+
+
+def g2_identity(rep: Report, tag: str, path: Path, spec: dict, have: set[str]) -> None:
+    n_rows = pq.ParquetFile(path).metadata.num_rows
+    if n_rows == spec["rows"]:
+        rep.ok("G2", tag, "row_count", f"{n_rows:,}")
+    else:
+        rep.add("G2", tag, "row_count", FAIL,
+                f"file has {n_rows:,}, manifest says {spec['rows']:,} "
+                f"(difference {n_rows - spec['rows']:+,})")
+
+    cols = [c for c in ("date", "bar_time") if c in have]
+    df = pq.read_table(path, columns=cols).to_pandas()
+
+    d = as_date_series(df["date"])
+    lo, hi = d.min().isoformat(), d.max().isoformat()
+    want_lo, want_hi = spec["date_range"]
+    if [lo, hi] == [want_lo, want_hi]:
+        rep.ok("G2", tag, "date_range", f"{lo} .. {hi}")
+    else:
+        rep.add("G2", tag, "date_range", FAIL,
+                f"file spans {lo} .. {hi}, manifest says {want_lo} .. {want_hi}")
+
+    n_days = d.nunique()
+    if n_days == spec["n_days"]:
+        rep.ok("G2", tag, "n_days", str(n_days))
+    else:
+        rep.add("G2", tag, "n_days", FAIL,
+                f"file has {n_days} sessions, manifest says {spec['n_days']}")
+
+    have_bars = sorted(df["bar_time"].astype(str).unique())
+    want_bars = sorted(spec["bar_times"])
+    if have_bars == want_bars:
+        rep.ok("G2", tag, "bar_times", f"{len(have_bars)} bars")
+    else:
+        rep.add("G2", tag, "bar_times", FAIL,
+                f"grid mismatch. only in file: {sorted(set(have_bars) - set(want_bars))}; "
+                f"only in manifest: {sorted(set(want_bars) - set(have_bars))}")
+
+    per_bar = df.groupby(["date", "bar_time"], observed=True).size()
+    med = int(per_bar.median())
+    want_med = spec["median_names_per_bar"]
+    if med == want_med:
+        rep.ok("G2", tag, "median_names_per_bar", str(med))
+    else:
+        rep.add("G2", tag, "median_names_per_bar", WARN,
+                f"file median {med}, manifest says {want_med}")
+
+
+def g3_keys(rep: Report, tag: str, path: Path, have: set[str]) -> None:
+    cols = [c for c in KEY_COLS if c in have]
+    df = pq.read_table(path, columns=cols).to_pandas()
+
+    nulls = {c: int(df[c].isna().sum()) for c in cols}
+    bad = {c: n for c, n in nulls.items() if n}
+    if bad:
+        rep.add("G3", tag, "no_null_keys", FAIL, f"null key values: {bad}")
+    else:
+        rep.ok("G3", tag, "no_null_keys")
+
+    n_dup = int(df.duplicated(subset=cols).sum())
+    if n_dup == 0:
+        rep.ok("G3", tag, "no_duplicate_keys", f"on {cols}")
+    else:
+        rep.add("G3", tag, "no_duplicate_keys", FAIL,
+                f"{n_dup:,} duplicate rows on {cols}. A duplicated key means the "
+                f"same bar appears twice and every cross-sectional statistic is "
+                f"weighted wrong.")
+    del df
+
+
+def g4_prices_recompute(rep: Report, tag: str, path: Path, have: set[str]) -> None:
+    """§11.3 -- the single strongest integrity check available, and it is cheap."""
+    need = ["entry_price", "exit_price", "target"]
+    if not set(need) <= have:
+        rep.add("G4", tag, "recompute_target", FAIL,
+                f"missing {sorted(set(need) - have)}")
         return
 
-    absent = [c for c in EXPECTED_EXTRAS if c not in df.columns]
-    rep.warn(not absent, "expected extras present",
-             f"missing {absent}" if absent else "")
+    df = pq.read_table(path, columns=need).to_pandas()
 
-    # -- 2. identity ----------------------------------------------------
-    # The overwrite that cost a rerun would have been caught here: a file
-    # named for one period holding another.
-    print("\n  2. IDENTITY (does the file match what the manifest claims?)")
-    lo, hi = str(df["date"].min().date()), str(df["date"].max().date())
-    exp_lo, exp_hi = spec.get("date_range", [None, None])
-    rep.check(exp_lo is None or (lo == exp_lo and hi == exp_hi),
-              "date range matches manifest",
-              f"file {lo}..{hi}, manifest {exp_lo}..{exp_hi}")
-
-    exp_rows = spec.get("rows")
-    rep.check(exp_rows is None or len(df) == exp_rows,
-              "row count matches manifest",
-              f"file {len(df):,}, manifest {exp_rows:,}"
-              if exp_rows else "")
-
-    name_years = {int(t) for t in path.stem.split("_") if t.isdigit()
-                  and 2000 < int(t) < 2100}
-    file_years = set(df["date"].dt.year.unique())
-    if name_years:
-        rep.check(name_years <= file_years,
-                  "filename years present in the data",
-                  f"name says {sorted(name_years)}, "
-                  f"file holds {sorted(file_years)}")
-
-    # -- 3. keys --------------------------------------------------------
-    print("\n  3. KEYS")
-    dupes = df.duplicated(["symbol", "date", "bar_time"]).sum()
-    rep.check(dupes == 0, "no duplicate (symbol, date, bar_time)",
-              f"{dupes:,} duplicates" if dupes else "")
-
-    nulls = df[["symbol", "date", "bar_time"]].isna().sum().sum()
-    rep.check(nulls == 0, "no null keys", f"{nulls:,} nulls" if nulls else "")
-
-    # -- 4. prices, and does the target recompute? -----------------------
-    print("\n  4. PRICES  (the strongest check)")
-    for col in ("entry_price", "exit_price"):
-        n_null = int(df[col].isna().sum())
-        rep.warn(n_null / len(df) < 0.01, f"{col} mostly present",
-                 f"{100*n_null/len(df):.2f}% null")
-        pos = df[col].dropna()
-        lo_b, hi_b = BOUNDS[col]
-        bad = int(((pos < lo_b) | (pos > hi_b)).sum())
-        rep.check(bad == 0, f"{col} within [{lo_b}, {hi_b}]",
-                  f"{bad:,} outside" if bad else "")
-
-    # target should equal exit/entry - 1. If it does not, the prices and the
-    # label came from different sources and nothing downstream is meaningful.
-    d = df.dropna(subset=["entry_price", "exit_price", "target"])
-    if len(d):
-        recomputed = d["exit_price"] / d["entry_price"] - 1.0
-        err = (recomputed - d["target"]).abs()
-        max_err = float(err.max())
-        share_bad = float((err > 1e-6).mean())
-        rep.check(share_bad < 0.001,
-                  "target recomputes from entry_price and exit_price",
-                  f"{100*share_bad:.3f}% mismatch, max error {max_err:.2e}")
-    else:
-        rep.check(False, "target recomputes", "no rows with both prices")
-
-    # -- 5. signal ------------------------------------------------------
-    print("\n  5. SIGNAL")
-    sp = df["score_pct"].dropna()
-    rep.check(sp.min() >= 0 and sp.max() <= 1, "score_pct within [0, 1]",
-              f"[{sp.min():.4f}, {sp.max():.4f}]")
-
-    # Within a cross-section the percentile should span nearly the full range.
-    sec = df.groupby(["date", "bar_time"], observed=True)["score_pct"]
-    spans = (sec.max() - sec.min()).dropna()
-    rep.warn(float(spans.median()) > 0.9,
-             "score_pct spans its cross-section",
-             f"median span {spans.median():.3f}")
-
-    n_score_null = int(df["score"].isna().sum())
-    rep.check(n_score_null == 0, "no null scores",
-              f"{n_score_null:,} null" if n_score_null else "")
-
-    # -- 6. grid --------------------------------------------------------
-    print("\n  6. GRID")
-    bars = sorted(df["bar_time"].astype(str).unique())
-    exp_bars = spec.get("bar_times")
-    rep.check(exp_bars is None or bars == sorted(exp_bars),
-              "bar times match manifest",
-              f"{len(bars)} bars {bars[0]}..{bars[-1]}")
-
-    sizes = df.groupby(["date", "bar_time"], observed=True).size()
-    med = float(sizes.median())
-    rep.warn(med > 100, "cross-sections plausibly sized",
-             f"median {med:.0f} names")
-
-    per_day = df.groupby("date", observed=True)["bar_time"].nunique()
-    rep.warn(float(per_day.std()) < 1.0, "bar count stable across days",
-             f"mean {per_day.mean():.1f}, sd {per_day.std():.2f}")
-
-    # -- 7. reconcile against upstream ----------------------------------
-    if upstream is not None:
-        print("\n  7. RECONCILE AGAINST UPSTREAM SOURCE")
-        src = upstream / spec.get("source", "")
-        if src.exists():
-            s = pd.read_parquet(src, columns=["date"])
-            s["date"] = pd.to_datetime(s["date"])
-            rep.check(len(s) == len(df), "row count matches source",
-                      f"handover {len(df):,}, source {len(s):,}")
-            rep.check(str(s["date"].min().date()) == lo
-                      and str(s["date"].max().date()) == hi,
-                      "date range matches source",
-                      f"source {s['date'].min().date()}..{s['date'].max().date()}")
+    for c in ("entry_price", "exit_price"):
+        n_null = int(df[c].isna().sum())
+        n_nonpos = int((df[c] <= 0).sum())
+        if n_null or n_nonpos:
+            rep.add("G4", tag, f"{c}_valid", FAIL,
+                    f"{n_null:,} null, {n_nonpos:,} non-positive")
         else:
-            rep.warn(False, "source file reachable", f"{src} not found")
+            rep.ok("G4", tag, f"{c}_valid",
+                   f"min {df[c].min():.4f}, max {df[c].max():.2f}")
 
-    # -- 8. sanity ------------------------------------------------------
-    print("\n  8. SANITY")
+    n_null_t = int(df["target"].isna().sum())
+    if n_null_t:
+        rep.add("G4", tag, "target_not_null", WARN, f"{n_null_t:,} null targets")
+
+    recomputed = df["exit_price"] / df["entry_price"] - 1.0
+    diff = (recomputed - df["target"]).abs()
+    valid = diff.notna()
+    n = int(valid.sum())
+
+    n_tight = int((diff > RECOMPUTE_TIGHT).sum())
+    n_loose = int((diff > RECOMPUTE_LOOSE).sum())
+    frac_loose = n_loose / max(n, 1)
+    max_diff = float(diff.max()) if n else float("nan")
+
+    detail = (f"n={n:,}  max|diff|={max_diff:.3e}  "
+              f">{RECOMPUTE_TIGHT:.0e}: {n_tight:,}  "
+              f">{RECOMPUTE_LOOSE:.0e}: {n_loose:,} ({frac_loose:.6%})")
+
+    if frac_loose > LOOSE_FRAC_FAIL:
+        rep.add("G4", tag, "recompute_target", FAIL,
+                detail + "  -- the label did not come from these prices. "
+                         "STOP. Do not work around this (§11.5).")
+    elif n_loose:
+        rep.add("G4", tag, "recompute_target", WARN,
+                detail + "  -- a small subset disagrees; find out which rows before "
+                         "trusting P&L on them")
+    elif n_tight:
+        rep.add("G4", tag, "recompute_target", WARN,
+                detail + "  -- within 1e-6 but above float64 round-trip")
+    else:
+        rep.ok("G4", tag, "recompute_target", detail)
+    del df
+
+
+def g5_signal(rep: Report, tag: str, path: Path, have: set[str], n_groups: int) -> None:
+    need = ["score_pct", "score", "date", "bar_time"]
+    if not set(need) <= have:
+        rep.add("G5", tag, "score_pct_range", FAIL, f"missing {sorted(set(need) - have)}")
+        return
+
+    cols = need + (["index_name"] if "index_name" in have else [])
+    df = pq.read_table(path, columns=cols).to_pandas()
+
+    sp = df["score_pct"]
+    n_out = int(((sp < 0) | (sp > 1)).sum())
+    n_null = int(sp.isna().sum())
+    if n_out or n_null:
+        rep.add("G5", tag, "score_pct_range", FAIL,
+                f"{n_out:,} outside [0,1], {n_null:,} null")
+    else:
+        rep.ok("G5", tag, "score_pct_range", f"[{sp.min():.4f}, {sp.max():.4f}]")
+
+    gcols = [c for c in ("date", "bar_time", "index_name") if c in df.columns]
+    spans = df.groupby(gcols, observed=True)["score_pct"].agg(["min", "max"])
+    bad_span = int(((spans["max"] - spans["min"]) < 0.5).sum())
+    if bad_span:
+        rep.add("G5", tag, "score_pct_spans_section", WARN,
+                f"{bad_span:,} of {len(spans):,} cross-sections span <0.5 of [0,1]. "
+                f"A percentile that does not span its section was computed over the "
+                f"wrong group.")
+    else:
+        rep.ok("G5", tag, "score_pct_spans_section", f"{len(spans):,} sections")
+
+    # score_pct must be the within-section rank of score. Sampled: a full
+    # groupby-rank over 17.9M rows is expensive and a systematic break shows up
+    # in any sample.
+    rng = np.random.default_rng(0)
+    keys = spans.index.to_frame(index=False)
+    take = keys.iloc[rng.choice(len(keys), size=min(n_groups, len(keys)), replace=False)]
+    sample = df.merge(take, on=gcols, how="inner")
+    corrs = (sample.groupby(gcols, observed=True)[["score", "score_pct"]]
+                   .apply(lambda g: g["score"].corr(g["score_pct"], method="spearman")))
+    worst = float(corrs.min()) if len(corrs) else float("nan")
+    if len(corrs) and worst > 0.999:
+        rep.ok("G5", tag, "score_pct_ranks_score",
+               f"{len(corrs)} sampled sections, min rank-corr {worst:.6f}")
+    else:
+        rep.add("G5", tag, "score_pct_ranks_score", FAIL,
+                f"min rank-corr {worst:.6f} over {len(corrs)} sampled sections. "
+                f"score_pct is not the within-section rank of score.")
+    del df, sample
+
+
+def g6_grid(rep: Report, tag: str, path: Path, have: set[str]) -> None:
+    df = pq.read_table(path, columns=["date", "bar_time"]).to_pandas()
+    bars = sorted(df["bar_time"].astype(str).unique())
+
+    if "09:35" in bars:
+        rep.add("G6", tag, "no_0935_bar", FAIL,
+                "09:35 is present, but amendments §12.6 says a stride-4 grid "
+                "anchored at 09:30 never samples it. Either the grid changed or "
+                "this is not the file we think it is.")
+    else:
+        rep.ok("G6", tag, "no_0935_bar", f"earliest bar {bars[0]}")
+
+    mins = [int(b[:2]) * 60 + int(b[3:]) for b in bars]
+    gaps = sorted(set(np.diff(sorted(mins))))
+    if gaps == [20]:
+        rep.ok("G6", tag, "stride_4_grid", "uniform 20-minute spacing")
+    else:
+        rep.add("G6", tag, "stride_4_grid", WARN,
+                f"spacings present: {gaps} minutes, expected only [20]")
+
+    d = pd.to_datetime(pd.Series(sorted(as_date_series(df["date"]).unique())))
+    n_weekend = int((d.dt.dayofweek >= 5).sum())
+    if n_weekend:
+        rep.add("G6", tag, "sessions_are_weekdays", FAIL,
+                f"{n_weekend} weekend session(s): "
+                f"{[x.date().isoformat() for x in d[d.dt.dayofweek >= 5][:5]]}")
+    else:
+        rep.ok("G6", tag, "sessions_are_weekdays", f"{len(d)} sessions")
+    del df
+
+
+def g8_distribution(rep: Report, tag: str, path: Path, have: set[str],
+                    spend_looks_ok: bool) -> None:
+    """Target moments for every file. IC for development only -- see the look
+    boundary in the module docstring."""
+    df = pq.read_table(path, columns=["target", "date"]).to_pandas()
     t = df["target"].dropna()
-    lo_b, hi_b = BOUNDS["target"]
-    bad = int(((t < lo_b) | (t > hi_b)).sum())
-    rep.check(bad == 0, f"target within [{lo_b}, {hi_b}]",
-              f"{bad:,} outside" if bad else "")
 
-    print(f"       mean {1e4*t.mean():+.2f} bps, sd {1e4*t.std():.0f} bps")
-    # Russell intraday drift ran -2.2 to -2.9 bps across development and
-    # +3.8 in validation. Far outside that is worth a look.
-    rep.warn(abs(1e4 * t.mean()) < 20, "mean target in a believable range",
-             f"{1e4*t.mean():+.2f} bps")
+    mean_bps = float(t.mean() * 1e4)
+    sd_bps = float(t.std() * 1e4)
+    lo, hi = EXPECTED_DRIFT_BPS.get(tag, (-np.inf, np.inf))
+    detail = f"mean {mean_bps:+.2f} bps, sd {sd_bps:.1f} bps, n={len(t):,}"
+    if lo <= mean_bps <= hi:
+        rep.ok("G8", tag, "universe_drift", detail + f"  (expected {lo:+g}..{hi:+g})")
+    else:
+        rep.add("G8", tag, "universe_drift", WARN,
+                detail + f"  -- outside the recorded range {lo:+g}..{hi:+g} bps. "
+                         f"Upstream recorded development negative and validation "
+                         f"+3.84. A mismatch means a different file.")
 
-    # Does the ranking actually order the outcome? A near-zero IC here would
-    # mean the scores and targets are misaligned.
-    smp = df.dropna(subset=["score", "target"]).sample(
-        min(200_000, len(df)), random_state=17)
-    ic = smp.groupby(["date", "bar_time"], observed=True).apply(
-        lambda g: g["score"].corr(g["target"], method="spearman")
-        if len(g) > 20 else np.nan, include_groups=False).dropna()
-    if len(ic):
-        rep.warn(float(ic.mean()) > 0.005,
-                 "scores rank the outcome (sampled IC)",
-                 f"IC {ic.mean():+.4f} over {len(ic):,} sections")
+    n_extreme = int((t.abs() > 1.0).sum())
+    if n_extreme:
+        rep.add("G8", tag, "no_absurd_returns", WARN,
+                f"{n_extreme:,} intraday returns beyond +/-100%")
+    else:
+        rep.ok("G8", tag, "no_absurd_returns")
+
+    if not spend_looks_ok:
+        rep.ok("G8", tag, "ic_skipped",
+               "validation is SPENT -- no score-versus-target statistic computed "
+               "here (§16). Target moments above use labels only and spend nothing.")
+        del df
+        return
+
+    sc = pq.read_table(path, columns=["score_pct"]).to_pandas()["score_pct"]
+    sub = pd.DataFrame({"date": df["date"], "s": sc, "t": df["target"]}).dropna()
+    # Aggregate to the DAY before saying anything about significance: bars within
+    # a day share market moves (spec §8).
+    daily = sub.groupby("date").apply(
+        lambda g: g["s"].corr(g["t"], method="spearman"), include_groups=False)
+    ic = float(daily.mean())
+    want = EXPECTED_IC.get(tag)
+    detail = f"mean daily rank IC {ic:+.4f} over {len(daily)} days (manifest {want})"
+    if want is None:
+        rep.ok("G8", tag, "sampled_ic", detail)
+    elif abs(ic - want) < 0.010:
+        rep.ok("G8", tag, "sampled_ic", detail)
+    else:
+        rep.add("G8", tag, "sampled_ic", WARN,
+                detail + " -- daily-mean IC differs from the pooled figure the "
+                         "manifest records; they are not the same estimator, but a "
+                         "large gap means scores and targets may be misaligned.")
+    del df, sub
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+
+def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--handover", type=Path,
-                    default=Path("../two-stage-intraday/handover"))
-    ap.add_argument("--upstream", type=Path,
-                    default=Path("../two-stage-intraday"))
-    ap.add_argument("--strict", action="store_true",
-                    help="treat warnings as failures")
+    ap.add_argument("--strict", action="store_true", help="warnings become failures")
+    ap.add_argument("--no-hash", action="store_true", help="skip sha256 of inputs")
+    ap.add_argument("--sample-groups", type=int, default=2000,
+                    help="cross-sections sampled for the score_pct rank check")
+    ap.add_argument("--outdir", type=Path, default=None)
     args = ap.parse_args()
 
-    pd.set_option("display.width", 200)
+    try:
+        P = load_paths()
+    except Exception as exc:  # noqa: BLE001
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return 2
 
-    print("=" * 78)
-    print("HANDOVER VERIFICATION")
-    print("=" * 78)
-    print(f"  handover: {args.handover.resolve()}")
+    manifest_path = Path(P["handover"]["manifest"])
+    manifest = json.loads(manifest_path.read_text())
+    outdir = args.outdir or Path(P["outputs"]["artifacts"]) / "00_verify"
 
-    man_path = args.handover / "MANIFEST.json"
-    if not man_path.exists():
-        sys.exit(f"No manifest at {man_path}. The handover is not "
-                 "self-describing without it; rebuild with scripts/17 "
-                 "upstream.")
-    manifest = json.loads(man_path.read_text())
+    rep = Report()
+    provenance = {
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join(sys.argv),
+        "git_commit": git_commit(),
+        "manifest": str(manifest_path),
+        "manifest_created": manifest.get("created"),
+        "inputs": {},
+    }
 
-    print(f"  created: {manifest.get('created')}")
-    print(f"  model:   {manifest['model']['universe']}")
-    print(f"           {manifest['model']['training']}")
-    print(f"           deploy on {manifest['model']['deploy_on']}")
-    spent = manifest.get("spent_looks", {})
-    print(f"  spent:   validation stage2 x{spent.get('validation_stage2', '?')}, "
-          f"stage1 x{spent.get('validation_stage1', '?')}, "
-          f"holdout x{spent.get('holdout', '?')}")
+    for tag, spec in manifest["files"].items():
+        path = Path(P["handover"]["dir"]) / spec["file"]
+        is_validation = spec.get("phase") == "validation"
+        print(f"\n=== {tag}  ({'VALIDATION - SPENT' if is_validation else 'development'})",
+              file=sys.stderr)
 
-    rep = Report(args.strict)
-    files = manifest.get("files", {})
-    if not files:
-        sys.exit("Manifest lists no files.")
-
-    for name, spec in files.items():
-        p = args.handover / spec["file"]
-        if not p.exists():
-            rep.check(False, f"{spec['file']} exists", "not found")
+        have = g1_structure(rep, tag, path, spec)
+        if have is None:
             continue
-        verify_file(p, spec, rep, args.upstream)
 
-    # -- summary --------------------------------------------------------
-    print("\n" + "=" * 78)
-    print("SUMMARY")
-    print("=" * 78)
-    if rep.failures:
-        print(f"  {len(rep.failures)} FAILURE(S):")
-        for f in rep.failures:
-            print(f"    - {f}")
-    if rep.warnings:
-        print(f"\n  {len(rep.warnings)} warning(s):")
-        for w in rep.warnings:
-            print(f"    - {w}")
+        provenance["inputs"][tag] = {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": None if args.no_hash else sha256(path),
+        }
 
-    if not rep.failures and not rep.warnings:
-        print("  All checks passed.")
-    elif not rep.failures:
-        print("\n  No failures. Warnings are worth reading before proceeding.")
+        for label, fn in (
+            ("G2 identity", lambda: g2_identity(rep, tag, path, spec, have)),
+            ("G3 keys", lambda: g3_keys(rep, tag, path, have)),
+            ("G4 prices + recompute", lambda: g4_prices_recompute(rep, tag, path, have)),
+            ("G5 signal", lambda: g5_signal(rep, tag, path, have, args.sample_groups)),
+            ("G6 grid", lambda: g6_grid(rep, tag, path, have)),
+            ("G8 distribution", lambda: g8_distribution(rep, tag, path, have,
+                                                        spend_looks_ok=not is_validation)),
+        ):
+            print(f"  {label} ...", file=sys.stderr)
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001
+                rep.add(label.split()[0], tag, "check_raised", FAIL, repr(exc))
 
-    print("\n  Cautions from the manifest:")
-    for c in manifest.get("cautions", []):
-        print(f"    - {c}")
+    # G7: totals across files
+    total_manifest = sum(s["rows"] for s in manifest["files"].values())
+    total_actual = sum(
+        pq.ParquetFile(Path(P["handover"]["dir"]) / s["file"]).metadata.num_rows
+        for s in manifest["files"].values()
+        if (Path(P["handover"]["dir"]) / s["file"]).exists()
+    )
+    if total_actual == total_manifest:
+        rep.ok("G7", "ALL", "total_rows", f"{total_actual:,}")
+    else:
+        rep.add("G7", "ALL", "total_rows", FAIL,
+                f"{total_actual:,} on disk against {total_manifest:,} in the manifest")
 
-    if rep.failures:
-        print("\n  >>> Do not run analysis on this data until the failures are")
-        print("  >>> resolved. Four times upstream, a bad file produced")
-        print("  >>> plausible numbers that were acted on.")
-        sys.exit(1)
+    for name, want in (("validation_stage2", 1), ("validation_stage1", 1), ("holdout", 0)):
+        got = manifest["spent_looks"].get(name)
+        if got == want:
+            rep.ok("G7", "ALL", f"spent_looks.{name}", str(got))
+        else:
+            rep.add("G7", "ALL", f"spent_looks.{name}", FAIL,
+                    f"manifest says {got}, expected {want}. If a look was genuinely "
+                    f"taken, update this project's spec too.")
+
+    # --- write BEFORE printing (§13: a 69-minute build was lost this way) ---
+    counts = rep.counts()
+    failed = counts[FAIL] > 0 or (args.strict and counts[WARN] > 0)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "verify_report.json").write_text(json.dumps({
+        "provenance": provenance,
+        "strict": args.strict,
+        "counts": counts,
+        "result": "FAILED" if failed else "ok",
+        "checks": [asdict(c) for c in rep.checks],
+    }, indent=2))
+    pd.DataFrame([asdict(c) for c in rep.checks]).to_csv(
+        outdir / "verify_checks.csv", index=False)
+
+    # --- report ---
+    print("\n" + "=" * 74)
+    print("HANDOVER VERIFICATION")
+    print("=" * 74)
+    df = pd.DataFrame([asdict(c) for c in rep.checks])
+    for tag, sub in df.groupby("file", sort=False):
+        print(f"\n{tag}")
+        for _, r in sub.iterrows():
+            mark = {PASS: "  ok ", WARN: " WARN", FAIL: " FAIL"}[r.status]
+            print(f"  {mark}  {r.group}  {r['name']:<28} {r.detail}")
+
+    print(f"\n{counts[PASS]} passed, {counts[WARN]} warnings, {counts[FAIL]} failures")
+    print(f"written to {outdir.resolve()}")
+
+    if failed:
+        print("\nRESULT: FAILED. Do not proceed to analysis.")
+        print("§11.5: do not work around this. Find what produced the bad file,")
+        print("fix the producer, regenerate, re-verify.")
+        return 1
+
+    print("\nRESULT: ok")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
