@@ -99,13 +99,26 @@ bars:
 # (spy_above_200sma, spy_ret_prev, vxx_vol_63, vxx_vol_pct, spy_intraday) come
 # from the context ETFs. A bar with Russell prices and no SPY context is not a
 # scoreable bar.
+# MEASURED 2026-09-10 by scripts/13_holdout_prereq.py, correcting an earlier
+# reading of upstream §12.5 that collapsed raw/ into a single date.
 panel_end_dates:
-  sp500_and_etfs: 2026-08-25    # BINDING
-  spy: 2026-08-26
-  russell: 2026-08-27
+  sp500_names: 2026-08-25       # every S&P name, 162 sessions in 2026
+  context_etfs: 2026-08-26      # SPY, VXX, IWM -- all 163 sessions. BINDING
+  russell: 2026-08-27           # 98.9% coverage; 63.4% on 08-28, 4.0% on 08-31
   retried_files: 2026-08-31
 
-common_end_date: 2026-08-25
+# The S&P NAMES are not the constraint. Nothing in a Russell strategy needs
+# AAPL's bars. The regime block (spy_above_200sma, spy_ret_prev, vxx_vol_63,
+# vxx_vol_pct, spy_intraday) comes from the context ETFs, and all three end
+# 2026-08-26. spy_intraday is SPY open-to-bar, so SPY needs SAME-DAY data on
+# every scoring session -- it is the hard constraint, not a lagged one.
+# Which panels actually bind. The S&P names are excluded deliberately: a
+# Russell strategy needs Russell prices and the context ETFs, nothing else.
+# The invariant in src/data/paths.py checks common_end_date against the
+# earliest of THESE, not against every panel.
+binding_panels: [context_etfs, russell]
+
+common_end_date: 2026-08-26
 
 # ---------------------------------------------------------------------------
 # Windows
@@ -118,7 +131,7 @@ windows:
     nominal_start: 2025-09-01   # spec §9; a Monday, Labor Day, no session
     nominal_end: 2026-08-31     # spec §9
     effective_start: 2025-09-02 # first session after Labor Day
-    effective_end: 2026-08-25   # = common_end_date
+    effective_end: 2026-08-26   # = common_end_date
     status: FROZEN
     looks_spent: 0
     # Both truncations are STRUCTURAL, forced by the calendar and by the
@@ -126,8 +139,20 @@ windows:
     # picked determines either: coverage goes 100% -> 8% in one step, so any
     # floor between 0.09 and 1.00 returns the same date.
     truncation_reason: >
-      Start moved off a market holiday. End set by the earliest panel end date
-      (raw/, the context ETFs) per amendments §12.5, not by raw_russell/.
+      Start moved off a market holiday. End set by the context ETFs, which are
+      the only raw/ symbols this strategy needs -- measured 2026-08-26, not the
+      2026-08-25 that the S&P names stop at.
+    # The scored cross-section will be LARGER here than in any validated
+    # window. Russell membership is ~1,962 throughout, but the fraction passing
+    # upstream's eligibility filters has been rising: 35% (2020-22), 39%
+    # (2023-24), 46% (2025), giving panel sections of 688 / 767 / 893 at 10:50.
+    # Extrapolated, the holdout lands near 1,000-1,050.
+    #
+    # k=2 of ~1,020 is the 0.20th percentile against 0.22nd in validation -- a
+    # ~10% shift toward MORE selective. Small, and in the direction the sweep
+    # found mildly favourable through k=2. Recorded rather than corrected:
+    # switching the cut to a percentile now would reopen a frozen decision to
+    # chase a second-order effect.
     # Scoring this window is NOT a mechanical rerun. features_stage2_full stops
     # at 2025, so the stage 2 feature build must run first, then scoring under
     # the frozen configuration in amendments §15.

@@ -114,16 +114,35 @@ def check_invariants(P: dict) -> list[str]:
     ends = {k: _as_date(v, f"panel_end_dates.{k}")
             for k, v in P["panel_end_dates"].items()}
     common = _as_date(P["common_end_date"], "common_end_date")
-    earliest_key = min(ends, key=lambda k: ends[k])
-    earliest = ends[earliest_key]
 
-    if common != earliest:
+    # Only the panels this strategy actually consumes bind the end date. The
+    # S&P names stop a day earlier than the context ETFs and are irrelevant to
+    # a Russell strategy -- checking against every panel would cost a session
+    # for no reason. Naming the binding set forces that judgement to be
+    # explicit rather than implied by a min() over everything.
+    binding = P.get("binding_panels")
+    if not binding:
         problems.append(
-            f"common_end_date is {common}, but the earliest panel end date is "
-            f"{earliest} ({earliest_key}). The binding constraint is whichever "
-            f"tree stops first -- a bar with Russell prices and no context-ETF "
-            f"data is not a scoreable bar (amendments §12.5)."
-        )
+            "binding_panels is missing. It must name which entries of "
+            "panel_end_dates constrain common_end_date -- without it the "
+            "check silently reverts to 'earliest of everything', which is "
+            "wrong whenever a panel is present but unused.")
+    else:
+        unknown = [b for b in binding if b not in ends]
+        if unknown:
+            problems.append(f"binding_panels names entries absent from "
+                            f"panel_end_dates: {unknown}")
+        else:
+            sub = {k: ends[k] for k in binding}
+            earliest_key = min(sub, key=lambda k: sub[k])
+            earliest = sub[earliest_key]
+            if common != earliest:
+                problems.append(
+                    f"common_end_date is {common}, but the earliest BINDING "
+                    f"panel end date is {earliest} ({earliest_key}); binding "
+                    f"panels are {binding}. A bar with Russell prices and no "
+                    f"context-ETF data is not a scoreable bar."
+                )
 
     h = P["windows"]["holdout"]
     eff_end = _as_date(h["effective_end"], "holdout.effective_end")
@@ -200,9 +219,12 @@ def main() -> int:
             print(f"  FAIL  {p}")
     else:
         ends = {k: _as_date(v, k) for k, v in P["panel_end_dates"].items()}
+        binding = P.get("binding_panels", [])
+        sub = {k: ends[k] for k in binding if k in ends}
         h = P["windows"]["holdout"]
-        print(f"  ok    common_end_date {P['common_end_date']} == earliest panel end "
-              f"({min(ends, key=lambda k: ends[k])})")
+        print(f"  ok    common_end_date {P['common_end_date']} == earliest of "
+              f"binding panels {binding} "
+              f"({min(sub, key=lambda k: sub[k]) if sub else '?'})")
         print(f"  ok    holdout {h['effective_start']} .. {h['effective_end']}, "
               f"{h['status']}, {h['looks_spent']} looks spent")
 
