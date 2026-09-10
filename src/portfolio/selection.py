@@ -150,6 +150,48 @@ def _cut_size(cfg: SelectionConfig, section_size: pd.Series) -> pd.Series:
     return np.ceil(section_size * cfg.pct).astype(int)
 
 
+def prepare_ranked(h: Handover,
+                   bar_times: Sequence[str] | None = None) -> pd.DataFrame:
+    """Filter to the chosen bars and rank within each cross-section.
+
+    Split out from `select` because ranking sorts the whole panel and is the
+    expensive step, but depends ONLY on the bar-time filter -- not on k, sides,
+    or the cap. A sweep over those can rank once per timing option and reuse
+    it, which is the difference between minutes and hours.
+
+    The returned frame carries `_bar_times` in `.attrs` so `select_ranked` can
+    refuse a config that does not match it. Note df.attrs holds scalars and
+    plain containers only; pandas serialises to JSON on parquet write.
+    """
+    missing = [c for c in NEEDED if c not in h.df.columns]
+    if missing:
+        raise ValueError(f"{h.key}: panel is missing {missing}")
+
+    df = h.df
+    if bar_times is not None:
+        keep = set(bar_times)
+        df = df[df["bar_time"].isin(keep)]
+        if df.empty:
+            raise ValueError(f"no rows at bar_times={sorted(keep)}; "
+                             f"available: {sorted(h.df['bar_time'].unique())}")
+
+    out = _rank_both_ways(df[NEEDED].copy())
+    out.attrs["_bar_times"] = None if bar_times is None else sorted(bar_times)
+    return out
+
+
+def select_ranked(ranked: pd.DataFrame, cfg: SelectionConfig) -> pd.DataFrame:
+    """Apply a config to an already-ranked frame from `prepare_ranked`."""
+    want = None if cfg.bar_times is None else sorted(cfg.bar_times)
+    have = ranked.attrs.get("_bar_times", "MISSING")
+    if have != want:
+        raise ValueError(
+            f"ranked frame was prepared for bar_times={have} but the config "
+            f"asks for {want}. Reusing a ranked frame across different timing "
+            f"silently ranks the wrong cross-sections.")
+    return _select_from_ranked(ranked, cfg)
+
+
 def select(h: Handover, cfg: SelectionConfig) -> pd.DataFrame:
     """Panel -> trades. One row per position taken.
 
@@ -162,19 +204,10 @@ def select(h: Handover, cfg: SelectionConfig) -> pd.DataFrame:
     Raises if the daily cap would bind while bar_times is unset -- see the
     module docstring.
     """
-    missing = [c for c in NEEDED if c not in h.df.columns]
-    if missing:
-        raise ValueError(f"{h.key}: panel is missing {missing}")
+    return _select_from_ranked(prepare_ranked(h, cfg.bar_times), cfg)
 
-    df = h.df
-    if cfg.bar_times is not None:
-        keep = set(cfg.bar_times)
-        df = df[df["bar_time"].isin(keep)]
-        if df.empty:
-            raise ValueError(f"no rows at bar_times={sorted(keep)}; "
-                             f"available: {sorted(h.df['bar_time'].unique())}")
 
-    df = _rank_both_ways(df[NEEDED].copy())
+def _select_from_ranked(df: pd.DataFrame, cfg: SelectionConfig) -> pd.DataFrame:
     n = _cut_size(cfg, df["section_size"])
 
     parts = []

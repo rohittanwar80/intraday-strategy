@@ -1,0 +1,49 @@
+{
+  "window": "development_2023_2024",
+  "note": "Contaminated before the split was declared; see Phase 2.",
+  "looks": [
+    {
+      "at": "2026-09-10T02:23:25.876000+00:00",
+      "git_commit": "456ca8366c4b224ae2be437085a884d8de0e0063",
+      "command": "scripts/06_finalists.py --confirm",
+      "sweep_dir": "/Users/rohittanwar/Documents/Claude/Projects/intraday-strategy/artifacts/05_sweep/sweep_development_2020_2022_20260910-000638",
+      "n_configs": 4,
+      "configs": [
+        {
+          "bars": "wide_am",
+          "k": 2,
+          "sides": "both",
+          "max_positions": 20,
+          "unique_symbols": true
+        },
+        {
+          "bars": "wide_am",
+          "k": 3,
+          "sides": "both",
+          "max_positions": 20,
+          "unique_symbols": true
+        },
+        {
+          "bars": "morning",
+          "k": 5,
+          "sides": "both",
+          "max_positions": 20,
+          "unique_symbols": true
+        },
+        {
+          "bars": "morning",
+          "k": 5,
+          "sides": "both",
+          "max_positions": 40,
+          "unique_symbols": true
+        }
+      ],
+      "result_ratios": [
+        0.93,
+        0.934,
+        0.805,
+        0.917
+      ]
+    }
+  ]
+}
